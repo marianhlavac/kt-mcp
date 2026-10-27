@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kt-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // Required by @cloudflare/workers-oauth-provider when it fetches Client ID
+  // Metadata Documents (Claude's "Use Claude's published identity" option).
+  // kaloricketabulky.cz is a public host, so the flag costs nothing here.
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "upload_source_maps": true,
+  "observability": { "enabled": true },
+
+  // Create both namespaces with `wrangler kv namespace create <BINDING>` and
+  // paste the ids it prints. See README → Setup.
+  "kv_namespaces": [
+    { "binding": "KT_SESSION", "id": "REPLACE_WITH_KT_SESSION_NAMESPACE_ID" },
+    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_OAUTH_KV_NAMESPACE_ID" }
+  ],
+
+  // Slows down passphrase guessing on the OAuth consent page: 10 POSTs per
+  // minute per client IP, per Cloudflare location. Optional — the code skips
+  // the check when the binding is absent — so remove this block if your
+  // account cannot use the Rate Limiting binding.
+  "ratelimits": [
+    { "name": "AUTH_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+  ]
+
+  // Secrets (never here): KT_EMAIL, KT_PASSWORD, MCP_AUTH_PASSWORD and/or
+  // MCP_AUTH_TOKEN via `wrangler secret put NAME`; .dev.vars for `wrangler dev`.
+}

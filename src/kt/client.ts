@@ -8,9 +8,14 @@
  * None of this is documented or guaranteed by Dine4Fit. Every call that
  * deviates from the shape we expect throws rather than guessing, so a
  * frontend change surfaces as a loud error instead of a wrong calorie count.
+ *
+ * Runs on Cloudflare Workers, so only Web APIs: global `fetch`, `crypto.subtle`.
+ * The session cookie lives in a SessionStore (Workers KV plus this isolate's
+ * memory) rather than on the instance, because each request may land on a
+ * fresh isolate and the login would otherwise repeat on every call.
  */
 
-import { createHash } from 'node:crypto';
+import type { SessionStore } from './session.js';
 
 const BASE = 'https://www.kaloricketabulky.cz';
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
@@ -104,7 +109,7 @@ export function baseUnitOf(units: UnitOption[]): string {
 export function parseCzechNumber(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
   if (typeof value !== 'string') return null;
-  const normalised = value.replace(/[\s  ]/g, '').replace(',', '.');
+  const normalised = value.replace(/[\s  ]/g, '').replace(',', '.');
   if (normalised === '') return null;
   const n = Number(normalised);
   return Number.isFinite(n) ? n : null;
@@ -118,8 +123,8 @@ export function formatCzechDate(date: Date): string {
 }
 
 export function todayCzech(): string {
-  // The diary runs on Czech wall-clock time; the server usually doesn't
-  // (containers default to UTC, which would flip the date around midnight).
+  // The diary runs on Czech wall-clock time; Workers run on UTC, which would
+  // flip the date around midnight.
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Europe/Prague',
     day: '2-digit',
@@ -141,21 +146,43 @@ export function assertCzechDate(date: string): string {
   return date;
 }
 
+/**
+ * Hex MD5, as the site's own login form computes it before posting. MD5 is
+ * not part of the WebCrypto standard; Cloudflare Workers support it as a
+ * documented extension for exactly this kind of legacy interop. The hash is
+ * password-equivalent to the site, so treat it like the password itself.
+ */
+export async function md5Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('MD5', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+}
+
 export interface KtCredentials {
   email: string;
   password: string;
 }
 
+interface RawResponse {
+  status: number;
+  redirectedToLogin: boolean;
+  text: string;
+  /** A `JSESSIONID=…` pair the site issued on this response, if any. */
+  setCookie: string | null;
+}
+
 export class KtClient {
-  private cookie: string | null = null;
+  /** `undefined` until the store has been consulted; `null` when there is no cookie. */
+  private cookie: string | null | undefined = undefined;
   private loginInFlight: Promise<void> | null = null;
 
-  constructor(private readonly credentials: KtCredentials) {}
+  constructor(
+    private readonly credentials: KtCredentials,
+    private readonly sessions: SessionStore,
+  ) {}
 
-  private async request(
-    path: string,
-    init: { method?: string; body?: unknown } = {},
-  ): Promise<{ status: number; redirectedToLogin: boolean; text: string }> {
+  private async request(path: string, init: { method?: string; body?: unknown } = {}): Promise<RawResponse> {
+    if (this.cookie === undefined) this.cookie = await this.sessions.load();
+
     const headers: Record<string, string> = {
       'User-Agent': UA,
       Accept: 'application/json',
@@ -171,15 +198,16 @@ export class KtClient {
     });
 
     // Capture a rotated session cookie whenever the site issues one.
-    const setCookie = response.headers.getSetCookie?.() ?? [];
-    const jsession = setCookie.find(c => c.startsWith('JSESSIONID='));
-    if (jsession) this.cookie = jsession.split(';')[0] ?? null;
+    const setCookies = response.headers.getSetCookie?.() ?? [];
+    const jsession = setCookies.find(c => c.startsWith('JSESSIONID='));
+    const setCookie = jsession ? (jsession.split(';')[0] ?? null) : null;
+    if (setCookie) this.cookie = setCookie;
 
     // Spring Security answers unauthenticated /user/** with a 302 to /login.
     const location = response.headers.get('location') ?? '';
     const redirectedToLogin = response.status >= 300 && response.status < 400 && location.includes('/login');
 
-    return { status: response.status, redirectedToLogin, text: await response.text() };
+    return { status: response.status, redirectedToLogin, text: await response.text(), setCookie };
   }
 
   private parseEnvelope(text: string, context: string): unknown {
@@ -202,29 +230,34 @@ export class KtClient {
     return body;
   }
 
-  /** Logs in, reusing an in-flight attempt so concurrent tool calls don't stampede. */
+  /**
+   * Logs in and persists the new cookie. Reuses an in-flight attempt so
+   * concurrent tool calls within one request don't stampede the login endpoint.
+   */
   private async login(): Promise<void> {
     if (this.loginInFlight) return this.loginInFlight;
     this.loginInFlight = (async () => {
       this.cookie = null;
-      const passwordHash = createHash('md5').update(this.credentials.password).digest('hex');
-      const { text } = await this.request('/login/create?format=json', {
+      const passwordHash = await md5Hex(this.credentials.password);
+      const { text, setCookie } = await this.request('/login/create?format=json', {
         method: 'POST',
         body: { email: this.credentials.email, password: passwordHash },
       });
       this.parseEnvelope(text, 'login');
-      if (!this.cookie) throw new KtError('login succeeded but no session cookie was issued');
+      if (!setCookie) throw new KtError('login succeeded but no session cookie was issued');
+      await this.sessions.save(setCookie);
     })().finally(() => {
       this.loginInFlight = null;
     });
     return this.loginInFlight;
   }
 
-  /** Runs an authenticated call, logging in on first use and once on session expiry. */
-  private async authed(
-    path: string,
-    init: { method?: string; body?: unknown } = {},
-  ): Promise<unknown> {
+  /**
+   * Runs an authenticated call, logging in when there is no cookie and once
+   * more when the site rejects the one we have (expired, or stale in KV).
+   */
+  private async authed(path: string, init: { method?: string; body?: unknown } = {}): Promise<unknown> {
+    if (this.cookie === undefined) this.cookie = await this.sessions.load();
     if (!this.cookie) await this.login();
     let result = await this.request(path, init);
     if (result.redirectedToLogin) {
@@ -232,6 +265,8 @@ export class KtClient {
       result = await this.request(path, init);
       if (result.redirectedToLogin) throw new KtError(`${path}: still unauthenticated after re-login`);
     }
+    // The site rotated the session on an authenticated call: keep the new one.
+    if (result.setCookie) await this.sessions.save(result.setCookie);
     return this.parseEnvelope(result.text, path);
   }
 

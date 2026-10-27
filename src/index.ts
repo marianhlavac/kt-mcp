@@ -1,120 +1,96 @@
 /**
- * Entrypoint: an Express app serving the MCP endpoint plus the OAuth 2.1
- * authorization-server endpoints the Claude connector flow needs.
+ * Entrypoint: a Cloudflare Worker serving one MCP endpoint behind two
+ * interchangeable ways to authenticate.
  *
- *   POST /mcp                                   the MCP endpoint (bearer-protected)
- *   /.well-known/oauth-protected-resource       RFC 9728 discovery
- *   /.well-known/oauth-authorization-server     RFC 8414 discovery
- *   /authorize /token /register /revoke         OAuth endpoints (from the SDK)
- *   GET /healthz                                liveness, unauthenticated
+ *   POST /mcp                                  the MCP endpoint
+ *   GET  /healthz                              liveness, unauthenticated
+ *
+ * Token mode (MCP_AUTH_TOKEN set): a fixed `Authorization: Bearer` header is
+ * compared in constant time and the request goes straight to the tools.
+ *
+ * OAuth mode (MCP_AUTH_PASSWORD set): everything else is routed through
+ * @cloudflare/workers-oauth-provider, which adds
+ *
+ *   /.well-known/oauth-protected-resource/mcp  RFC 9728 discovery
+ *   /.well-known/oauth-authorization-server    RFC 8414 discovery
+ *   /authorize /token /register                authorization code + PKCE, DCR, CIMD
+ *
+ * and validates OAuth bearer tokens on /mcp. Both modes may be on at once.
  */
 
-import express from 'express';
-import { join } from 'node:path';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
-import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
-import { loadConfig } from './config.js';
+import { bearerToken, secretMatches } from './auth.js';
+import { ConfigError, loadConfig, type Config, type Env } from './env.js';
 import { KtClient } from './kt/client.js';
-import { registerTools } from './mcp/tools.js';
-import { MCP_SCOPE, SingleUserOAuthProvider } from './auth/provider.js';
+import { KvSessionStore } from './kt/session.js';
+import { handleMcpRequest, jsonRpcError } from './mcp/handler.js';
+import { providerFor } from './oauth.js';
 
-const config = loadConfig();
-const mcpEndpoint = new URL('/mcp', config.publicUrl);
-
-const kt = new KtClient({ email: config.ktEmail, password: config.ktPassword });
-const provider = new SingleUserOAuthProvider(config.mcpAuthPassword, join(config.stateDir, 'oauth-state.json'));
-
-const app = express();
-app.disable('x-powered-by');
-// Trust exactly one hop — our own nginx — and no further. `true` would trust
-// any X-Forwarded-For the caller sends, letting an attacker mint a fresh
-// rate-limit bucket per request and defeat brute-force protection on
-// /authorize. nginx overwrites that header with Cloudflare's verified client
-// IP, so this resolves to the real caller.
-app.set('trust proxy', 1);
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: false }));
-
-/**
- * The MCP spec requires Origin validation to defend against DNS rebinding.
- * Browsers set Origin; Claude's server-side fetches do not, so only reject an
- * Origin that is present and foreign.
- */
-app.use((req, res, next) => {
-  const origin = req.get('origin');
-  if (origin !== undefined && origin !== config.publicUrl.origin) {
-    res.status(403).json({ jsonrpc: '2.0', error: { code: -32600, message: 'Forbidden origin' } });
-    return;
-  }
-  next();
-});
-
-app.get('/healthz', (_req, res) => {
-  res.json({ status: 'ok', endpoint: mcpEndpoint.href });
-});
-
-// OAuth authorization-server + protected-resource metadata and endpoints.
-// Must be mounted at the application root.
-app.use(
-  mcpAuthRouter({
-    provider,
-    issuerUrl: config.publicUrl,
-    resourceServerUrl: mcpEndpoint,
-    resourceName: 'CalTrack food logging',
-    scopesSupported: [MCP_SCOPE],
-  }),
-);
-
-const requireAuth = requireBearerAuth({
-  verifier: provider,
-  requiredScopes: [MCP_SCOPE],
-  resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpEndpoint),
-});
-
-/**
- * One MCP server and transport per request.
- *
- * The 2026-07-28 revision of Streamable HTTP removed protocol-level sessions,
- * so each POST is self-contained — statelessness is the intended shape here,
- * and it means a redeploy can never strand a half-open session.
- */
-app.post('/mcp', requireAuth, async (req, res) => {
-  const server = new McpServer(
-    { name: 'kaloricketabulky', version: '0.1.0' },
-    {
-      instructions:
-        'Logs food into the user\'s kaloricketabulky.cz diary. The food database is Czech: search with Czech terms for the best matches. ' +
-        'When the user gives a count rather than a weight ("3 eggs"), call get_food_portions and log a natural portion unit instead of estimating grams.',
-    },
-  );
-  registerTools(server, kt);
-
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  res.on('close', () => {
-    void transport.close();
-    void server.close();
+function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers },
   });
+}
 
-  try {
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (error) {
-    console.error('[mcp] request failed:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' } });
+function ktClient(env: Env, config: Config): KtClient {
+  // loadConfig has already checked that the binding exists.
+  return new KtClient({ email: config.ktEmail, password: config.ktPassword }, new KvSessionStore(env.KT_SESSION!));
+}
+
+/** The MCP endpoint as the OAuth provider calls it once a token has been validated. */
+async function oauthProtectedMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const config = loadConfig(env);
+  return handleMcpRequest(request, ktClient(env, config), ctx);
+}
+
+export default {
+  async fetch(request, env, ctx): Promise<Response> {
+    const url = new URL(request.url);
+
+    let config: Config;
+    try {
+      config = loadConfig(env);
+    } catch (error) {
+      if (error instanceof ConfigError) {
+        console.error('[config]', error.message);
+        return json(500, { error: 'server_misconfigured', message: error.message });
+      }
+      throw error;
     }
-  }
-});
 
-// Pre-2026-07-28 clients open a GET stream and DELETE sessions; this revision
-// has neither.
-app.all('/mcp', (_req, res) => {
-  res.status(405).json({ jsonrpc: '2.0', error: { code: -32601, message: 'Method not allowed' } });
-});
+    if (url.pathname === '/healthz') {
+      if (request.method !== 'GET') return json(405, { error: 'method_not_allowed' }, { Allow: 'GET' });
+      return json(200, { status: 'ok', endpoint: `${url.origin}/mcp` });
+    }
 
-app.listen(config.port, () => {
-  console.log(`kt-mcp listening on :${config.port}`);
-  console.log(`MCP endpoint (public): ${mcpEndpoint.href}`);
-});
+    if (url.pathname === '/mcp') {
+      // The MCP spec requires Origin validation against DNS rebinding. Browsers
+      // set Origin; Claude's server-side fetches do not, so only reject an
+      // Origin that is present and foreign.
+      const origin = request.headers.get('origin');
+      if (origin !== null && origin !== url.origin) {
+        return jsonRpcError(403, -32600, 'Forbidden origin');
+      }
+
+      if (config.authToken) {
+        const token = bearerToken(request);
+        if (token !== null && (await secretMatches(token, config.authToken))) {
+          return handleMcpRequest(request, ktClient(env, config), ctx);
+        }
+      }
+
+      if (!config.authPassword) {
+        // Token mode only: no authorization server to point the client at.
+        return jsonRpcError(401, -32000, 'Unauthorized', { 'WWW-Authenticate': 'Bearer realm="kt-mcp"' });
+      }
+    }
+
+    if (!config.authPassword) {
+      return json(404, { error: 'not_found' });
+    }
+
+    // OAuth mode: discovery, registration, token endpoints, the consent page,
+    // and /mcp with an OAuth bearer token.
+    return providerFor(url.origin, oauthProtectedMcp).fetch(request, env, ctx);
+  },
+} satisfies ExportedHandler<Env>;

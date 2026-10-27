@@ -1,6 +1,10 @@
 node_modules/
 dist/
-.env
+dist-test/
+dist-dry/
+.wrangler/
 *.log
-# Local-dev OAuth state (tokens!) — see STATE_DIR in .env.example
-data/
+# Local secrets for `wrangler dev` — see .dev.vars.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example

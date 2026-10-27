@@ -1,33 +1,36 @@
 {
   "name": "kt-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "Self-hosted remote MCP server exposing kaloricketabulky.cz food logging to AI agents",
+  "description": "Stateless Cloudflare Worker exposing kaloricketabulky.cz food logging to AI agents over MCP",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/stany9g/kt-mcp.git"
+    "url": "git+https://github.com/marianhlavac/kt-mcp.git"
   },
-  "bugs": "https://github.com/stany9g/kt-mcp/issues",
-  "homepage": "https://github.com/stany9g/kt-mcp#readme",
+  "bugs": "https://github.com/marianhlavac/kt-mcp/issues",
+  "homepage": "https://github.com/marianhlavac/kt-mcp#readme",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test \"dist/**/*.test.js\""
+    "test": "tsc -p tsconfig.test.json && node --test \"dist-test/**/*.test.js\"",
+    "check": "npm run typecheck && npm test && wrangler deploy --dry-run --outdir=dist-dry"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "express": "^5.2.1",
+    "@cfworker/json-schema": "^4.1.1",
+    "@cloudflare/workers-oauth-provider": "^1.2.4",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/express": "^5.0.6",
+    "@cloudflare/workers-types": "^5.20261027.1",
     "@types/node": "^24.13.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "wrangler": "^4.153.0"
   }
 }

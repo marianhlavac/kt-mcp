@@ -1,0 +1,15 @@
+# Copy to .dev.vars for `wrangler dev`. In production these are Worker secrets
+# (`wrangler secret put NAME`), never committed and never in wrangler.jsonc.
+
+# --- kaloricketabulky.cz account (the diary the tools write to) ---
+KT_EMAIL=you@example.com
+KT_PASSWORD=your-kaloricketabulky-password
+
+# --- Who may connect an agent to this server. Set one or both. ---
+# OAuth mode: the passphrase you type once on the consent page when adding the
+# connector in Claude. Minimum 12 characters; make it long and random.
+MCP_AUTH_PASSWORD=change-me-to-a-long-random-passphrase
+# Static-token mode: for clients that send a fixed Authorization header
+# (Claude Code, or claude.ai connectors with the Request headers option).
+# Minimum 24 characters. Generate with: openssl rand -base64 32
+# MCP_AUTH_TOKEN=

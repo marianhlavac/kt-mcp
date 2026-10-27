@@ -2,59 +2,75 @@
 # Verifies a deployed kt-mcp is reachable and correctly configured, before you
 # add it as a connector in Claude. Read-only: logs in to nothing, writes nothing.
 #
-#   ./scripts/verify-deployment.sh https://kt-mcp.example.com
+#   ./scripts/verify-deployment.sh https://kt-mcp.<you>.workers.dev
+#
+# With MCP_AUTH_TOKEN set in the environment it also calls tools/list through
+# token mode. With WAIT=1 it retries the first request until the server is up
+# (handy against `wrangler dev`).
 set -uo pipefail
 
 BASE="${1:-}"
 if [[ -z "$BASE" ]]; then
-  echo "usage: $0 https://<your-host>" >&2
+  echo "usage: $0 https://<your-worker-host>" >&2
   exit 2
 fi
 BASE="${BASE%/}"
-[[ "$BASE" == https://* ]] || { echo "FAIL  URL must be https:// — Claude and OAuth both require TLS" >&2; exit 1; }
 
 fails=0
 pass() { printf '  \033[32mok\033[0m    %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fails=$((fails + 1)); }
+retry=()
+[[ "${WAIT:-0}" == "1" ]] && retry=(--retry 30 --retry-delay 1 --retry-connrefused --retry-all-errors)
 
 echo "Verifying $BASE"
 
-# 1. Reachable over TLS from the public internet, which is what Claude needs.
-health=$(curl -fsS --max-time 15 "$BASE/healthz" 2>/dev/null)
+# 1. Reachable, and PUBLIC_URL-free: the Worker derives its endpoint from the request.
+health=$(curl -fsS --max-time 15 "${retry[@]}" "$BASE/healthz" 2>/dev/null)
 if [[ -z "$health" ]]; then
-  fail "GET /healthz — not reachable. Check (a) the tunnel's public hostname route exists in Cloudflare and points at http://localhost:80, and (b) 'docker ps' shows kt-mcp, kt-mcp-nginx and kt-mcp-tunnel up"
+  fail "GET /healthz not reachable. Check 'wrangler deployments list' and that the route or workers.dev subdomain is enabled"
   echo; echo "$fails check(s) failed."; exit 1
 fi
-pass "GET /healthz reachable over TLS"
-
-# 2. PUBLIC_URL must match the hostname actually being served, or OAuth
-#    discovery advertises a URL Claude cannot reach.
+pass "GET /healthz reachable"
 advertised=$(printf '%s' "$health" | sed -n 's/.*"endpoint":"\([^"]*\)".*/\1/p')
-if [[ "$advertised" == "$BASE/mcp" ]]; then
-  pass "PUBLIC_URL matches this hostname ($advertised)"
+[[ "$advertised" == "$BASE/mcp" ]] && pass "endpoint matches ($advertised)" || fail "endpoint mismatch: server says '$advertised', you reached '$BASE'"
+
+# 2. The MCP endpoint must challenge unauthenticated callers.
+headers=$(curl -s -D - -o /dev/null --max-time 15 -X POST "$BASE/mcp" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+grep -qi '^HTTP/[0-9.]* 401' <<<"$headers" && pass "POST /mcp without a token → 401" || fail "POST /mcp without a token did not return 401 — the endpoint may be unprotected"
+
+# 3. OAuth mode advertises its authorization server; token-only mode does not.
+if grep -qi 'www-authenticate:.*resource_metadata=' <<<"$headers"; then
+  pass "OAuth mode: 401 carries a resource_metadata challenge"
+  for path in "/.well-known/oauth-protected-resource/mcp" "/.well-known/oauth-authorization-server"; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$BASE$path")
+    [[ "$code" == "200" ]] && pass "GET $path → 200" || fail "GET $path → $code (expected 200)"
+  done
 else
-  fail "PUBLIC_URL mismatch: server advertises '$advertised' but you reached '$BASE'. Set PUBLIC_URL=$BASE and redeploy"
+  pass "token-only mode: no authorization server advertised (set MCP_AUTH_PASSWORD to enable OAuth)"
 fi
 
-# 3. Discovery documents Claude fetches during the connector handshake.
-for path in "/.well-known/oauth-protected-resource/mcp" "/.well-known/oauth-authorization-server"; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$BASE$path")
-  [[ "$code" == "200" ]] && pass "GET $path → 200" || fail "GET $path → $code (expected 200)"
+# 4. Stateless transport: nothing to GET or DELETE.
+for m in GET DELETE; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X "$m" "$BASE/mcp" -H 'Accept: application/json, text/event-stream')
+  case "$code" in 401|405) pass "$m /mcp → $code";; *) fail "$m /mcp → $code (expected 401 or 405)";; esac
 done
 
-# 4. The MCP endpoint must challenge unauthenticated callers, and the challenge
-#    must point back at the resource metadata or Claude cannot start OAuth.
-headers=$(curl -s -D - -o /dev/null --max-time 15 -X POST "$BASE/mcp" \
-  -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
-if grep -qi '^HTTP/[0-9.]* 401' <<<"$headers"; then
-  pass "POST /mcp without a token → 401"
-else
-  fail "POST /mcp without a token did not return 401 — the endpoint may be unprotected"
-fi
-if grep -qi 'www-authenticate:.*resource_metadata=' <<<"$headers"; then
-  pass "401 carries a resource_metadata challenge"
-else
-  fail "401 is missing the resource_metadata challenge — Claude will not discover the auth server"
+# 5. Optional: token mode end to end.
+if [[ -n "${MCP_AUTH_TOKEN:-}" ]]; then
+  body=$(curl -s --max-time 30 -X POST "$BASE/mcp" -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+  if grep -q '"name":"search_food"' <<<"$body"; then
+    pass "tools/list with MCP_AUTH_TOKEN lists the tools"
+  else
+    fail "tools/list with MCP_AUTH_TOKEN failed: ${body:0:200}"
+  fi
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST "$BASE/mcp" -H "Authorization: Bearer ${MCP_AUTH_TOKEN}x" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+  [[ "$code" == "401" ]] && pass "a near-miss token → 401" || fail "a near-miss token → $code"
 fi
 
 echo
