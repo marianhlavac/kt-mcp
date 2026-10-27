@@ -89,6 +89,24 @@ export interface MealSummary {
   portions: number;
 }
 
+export interface DiaryEntry {
+  /** The meal slot's title as the site names it ("Snídaně"), when the entry sits under one. */
+  meal: string | null;
+  title: string;
+  /** Human-readable portion, e.g. "2 × kus (55 g)", when the entry carries a count and a unit. */
+  amount: string | null;
+  /** Weight in grams the site computed for the portion, when present. */
+  grams: number | null;
+  energy: number | null;
+  energyUnit: string;
+  protein: number | null;
+  carbs: number | null;
+  fat: number | null;
+  fibre: number | null;
+  sugar: number | null;
+  salt: number | null;
+}
+
 export class KtError extends Error {}
 
 /**
@@ -155,6 +173,69 @@ export function assertCzechDate(date: string): string {
 export async function md5Hex(text: string): Promise<string> {
   const digest = await crypto.subtle.digest('MD5', new TextEncoder().encode(text));
   return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Pulls the individual entries out of the day's diary payload.
+ *
+ * The payload's exact layout is reverse-engineered, so this walks the whole
+ * tree and treats every `foodstuff` array as a list of entries, taking the
+ * nearest enclosing `title` as the meal name. Field names follow the shapes
+ * the site uses elsewhere (its add-entry form and recipe payloads). Returns
+ * an empty list rather than guessing when nothing matches, so the caller can
+ * fall back to the raw payload.
+ */
+export function diaryEntriesFrom(raw: unknown): DiaryEntry[] {
+  const entries: DiaryEntry[] = [];
+  const visit = (node: unknown, meal: string | null): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, meal);
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+    const obj = node as Record<string, unknown>;
+    const here = typeof obj['title'] === 'string' && obj['title'].trim() !== '' ? obj['title'] : meal;
+    const foods = obj['foodstuff'];
+    if (Array.isArray(foods)) {
+      for (const food of foods) {
+        if (food && typeof food === 'object' && !Array.isArray(food)) entries.push(entryFrom(food as Record<string, unknown>, here));
+      }
+    }
+    for (const [key, value] of Object.entries(obj)) {
+      if (key !== 'foodstuff' && value && typeof value === 'object') visit(value, here);
+    }
+  };
+  visit(raw, null);
+  return entries;
+}
+
+function entryFrom(f: Record<string, unknown>, meal: string | null): DiaryEntry {
+  const count = parseCzechNumber(f['count'] ?? f['multiplier']);
+  const units = Array.isArray(f['units']) ? (f['units'] as unknown[]) : [];
+  const selected = units.find(
+    (u): u is Record<string, unknown> => !!u && typeof u === 'object' && (u as Record<string, unknown>)['id'] === f['selectedUnitGuid'],
+  );
+  const unitTitle =
+    (selected && typeof selected['title'] === 'string' && selected['title']) ||
+    (typeof f['unitTitle'] === 'string' && f['unitTitle']) ||
+    (typeof f['unit'] === 'string' && f['unit']) ||
+    null;
+  const amount = count !== null && unitTitle ? `${count} × ${unitTitle}` : count !== null ? String(count) : null;
+
+  return {
+    meal,
+    title: String(f['title'] ?? ''),
+    amount,
+    grams: parseCzechNumber(f['weight']),
+    energy: parseCzechNumber(f['energy']),
+    energyUnit: typeof f['energyUnit'] === 'string' ? f['energyUnit'] : 'kcal',
+    protein: parseCzechNumber(f['protein']),
+    carbs: parseCzechNumber(f['carbohydrate']),
+    fat: parseCzechNumber(f['fat']),
+    fibre: parseCzechNumber(f['fiber']),
+    sugar: parseCzechNumber(f['sugar']),
+    salt: parseCzechNumber(f['salt']),
+  };
 }
 
 export interface KtCredentials {
@@ -394,9 +475,17 @@ export class KtClient {
     await this.authed('/user/foodstuff/add?format=json&=', { method: 'POST', body: payload });
   }
 
-  /** Raw daily summary. Shape is not fully documented, so it is passed through. */
+  /** Raw daily summary (totals only). Shape is not fully documented, so it is passed through. */
   async getDaySummary(date?: string): Promise<unknown> {
     return this.authed(`/statistic/summary/${date === undefined ? todayCzech() : assertCzechDate(date)}/get?format=json`);
+  }
+
+  /**
+   * The day's diary as the site's own diary page loads it: every entry,
+   * grouped by meal. See diaryEntriesFrom for how it is read.
+   */
+  async getDayDetail(date?: string): Promise<unknown> {
+    return this.authed(`/user/diary/${date === undefined ? todayCzech() : assertCzechDate(date)}/get?format=json`);
   }
 
   // ---------------------------------------------------------------------

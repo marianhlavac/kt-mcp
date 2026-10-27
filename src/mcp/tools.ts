@@ -8,7 +8,7 @@
 
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { GRAM_UNIT, KtClient, MEALS, type MealId, todayCzech } from '../kt/client.js';
+import { GRAM_UNIT, KtClient, MEALS, type MealId, diaryEntriesFrom, todayCzech } from '../kt/client.js';
 
 const MEAL_IDS = Object.keys(MEALS) as [MealId, ...MealId[]];
 
@@ -264,13 +264,40 @@ export function registerTools(server: McpServer, kt: KtClient): void {
     {
       title: 'Get a day summary',
       description:
-        'Read back totals from the diary for one day — use this when the user asks what they have eaten, how many calories they have left, or how a day went.',
+        'Read back the totals for one day: energy, macros and what remains of the target. It does not list the individual foods; call get_day_entries for those. ' +
+        'Use this when the user asks how many calories they have left or how a day went overall.',
       inputSchema: {
         date: z.string().optional().describe(dateDescription),
       },
     },
     guard('get_day_summary', async ({ date }) => {
       return json({ date: date ?? todayCzech(), summary: await kt.getDaySummary(date) });
+    }),
+  );
+
+  server.registerTool(
+    'get_day_entries',
+    {
+      title: "List a day's diary entries",
+      description:
+        'List the individual foods logged in the diary for one day, grouped by meal, each with its portion and macros. ' +
+        'Use this when the user asks what they ate, wants an entry checked, or wants to know whether something was already logged.',
+      inputSchema: {
+        date: z.string().optional().describe(dateDescription),
+      },
+    },
+    guard('get_day_entries', async ({ date }) => {
+      const raw = await kt.getDayDetail(date);
+      const entries = diaryEntriesFrom(raw);
+      if (entries.length > 0) return json({ date: date ?? todayCzech(), entries });
+      // Either nothing was logged or the payload has a shape we do not know.
+      // Hand the model the site's own data rather than a guess.
+      return json({
+        date: date ?? todayCzech(),
+        entries: [],
+        note: 'No entries recognised in the diary payload; the raw response follows in case the day is simply empty or the site changed its format.',
+        raw,
+      });
     }),
   );
 }

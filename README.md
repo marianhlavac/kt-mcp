@@ -38,7 +38,7 @@ Upstream runs an Express app in Docker behind nginx and a Cloudflare Tunnel on a
 | MD5 for the site's login | `node:crypto` | `crypto.subtle.digest('MD5')`, a documented Workers extension |
 | State to back up | A Docker volume | None. Lose the KV namespaces and you reconnect the connector once |
 
-Nothing about what the tools do, how portions are resolved, or which site endpoints are called has changed. Those parts are upstream's work; the caveats at the end are theirs too and still apply.
+The tools, portion handling and site endpoints are upstream's work, with one addition: `get_day_entries`, which lists the day's individual foods (upstream only had totals). The caveats at the end are upstream's too and still apply.
 
 ## Tools
 
@@ -49,6 +49,7 @@ Nothing about what the tools do, how portions are resolved, or which site endpoi
 | `get_food_nutrition` | Calories and macros for a quantity, scaled by the site itself. Read-only. |
 | `log_food` | Write an eating record into the diary. |
 | `get_day_summary` | Read back a day's totals. |
+| `get_day_entries` | List the individual foods logged that day, grouped by meal, with portion and macros. |
 | `create_meal` | Save a recipe built from existing foods. |
 | `list_my_meals` | List saved recipes with their ids and total energy. |
 | `log_meal` | Log a whole saved recipe into the diary as one entry. |
@@ -230,7 +231,7 @@ npm run check       # both, plus a dry-run bundle
 - **Egress.** Requests to kaloricketabulky.cz now come from Cloudflare's network. The first deployed `search_food` call tells you whether the site accepts that.
 - **One account per Worker.** Two people, two Workers (they can share a Cloudflare account).
 - **Personal use.** Automating entry into your own account is a far softer position than bulk scraping, but it is still outside anything Dine4Fit has sanctioned.
-- **`get_day_summary`** passes the site's response through unmodified because its shape isn't fully documented.
+- **`get_day_summary`** passes the site's response through unmodified because its shape isn't fully documented. **`get_day_entries`** reads the diary page's own payload and normalises every `foodstuff` list it finds; when it recognises nothing it returns the raw payload instead of guessing.
 - **Partial portions of a recipe cannot be logged.** The site ignores the count on the meal-add form and logs the whole recipe. Log the ingredients individually with `log_food` when only part of a recipe was eaten.
 
 ## License
