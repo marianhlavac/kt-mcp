@@ -13,8 +13,8 @@
   // Create both namespaces with `wrangler kv namespace create <BINDING>` and
   // paste the ids it prints. See README → Setup.
   "kv_namespaces": [
-    { "binding": "KT_SESSION", "id": "REPLACE_WITH_KT_SESSION_NAMESPACE_ID" },
-    { "binding": "OAUTH_KV", "id": "REPLACE_WITH_OAUTH_KV_NAMESPACE_ID" }
+    { "binding": "KT_SESSION", "id": "92f9f258b99b441ba66b553c117e16f3" },
+    { "binding": "OAUTH_KV", "id": "ca4e71fe4ff748b6b0c93950a61e9286" }
   ],
 
   // Slows down passphrase guessing and registration spam on /authorize,
