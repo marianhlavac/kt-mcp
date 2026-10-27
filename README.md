@@ -1,245 +1,238 @@
 # kt-mcp
 
-**🇨🇿 Česky** · [🇬🇧 English](README.en.md)
+A remote [MCP](https://modelcontextprotocol.io) server that connects an AI agent to your **kaloricketabulky.cz** food diary, packaged as a single **Cloudflare Worker** that runs on the free plan.
 
-Self-hosted [MCP](https://modelcontextprotocol.io) server, který propojí AI agenta s vaším jídelníčkem na **kaloricketabulky.cz**.
+You say *"I ate 3 eggs and a banana"*, and the agent searches the Czech food database, picks the right portion unit, and writes the entries into your real diary. The official app stays the source of truth, so premium features keep working.
 
-Řeknete *„snědl jsem 3 vejce a banán"* — agent prohledá českou databázi potravin, vybere správnou porci a zapíše záznamy do vašeho skutečného jídelníčku. Oficiální aplikace zůstává zdrojem pravdy, takže prémiové funkce fungují dál.
+This is a fork of [stany9g/kt-mcp](https://github.com/stany9g/kt-mcp) (Czech README there). The tools are the same; the hosting is not. See [What changed](#what-changed-from-upstream).
 
-Postaveno a otestováno s **Claudem** (desktop, mobil i web přes custom connector), ale server mluví standardním MCP přes HTTPS s OAuth 2.1, takže se může připojit jakýkoli agent, který podporuje vzdálené MCP servery.
-
-> ## Neoficiální projekt, bez vazby na Dine4Fit
+> ## Unofficial, and not affiliated with Dine4Fit
 >
-> kaloricketabulky.cz provozuje společnost **Dine4Fit, a.s.**, která s tímto
-> projektem nemá nic společného a nijak ho neschvaluje. Veřejné API neexistuje;
-> zde použité endpointy byly vyčteny z frontendového JavaScriptu samotného webu
-> a mohou se kdykoli bez varování změnit nebo rozbít.
+> kaloricketabulky.cz is operated by **Dine4Fit, a.s.**, who are not involved in
+> this project and do not endorse it. There is no public API; the endpoints used
+> here were read out of the site's own frontend JavaScript and may change or
+> break without notice.
 >
-> Podmínky Dine4Fit udělují **osobní, nekomerční** licenci. Tento software je
-> zveřejněn proto, abyste si mohli zautomatizovat přístup ke **svému vlastnímu
-> účtu** — což licence dovoluje. Provozovat ho jako placenou nebo víceuživatelskou
-> službu, případně dál šířit potravinová data, která vrací, je jiná věc a jde
-> na váš vrub. Databáze patří Dine4Fit a je chráněna evropskými databázovými právy.
+> Dine4Fit's terms grant a **personal, non-commercial** licence. This software is
+> published so that you can automate access to **your own account**, which is
+> what that licence permits. Running it as a paid or multi-tenant service, or
+> redistributing the food data it returns, is a different matter and is on you.
+> The database is Dine4Fit's and is protected by EU database rights.
 >
-> Držte frekvenci požadavků na lidské úrovni. Nestavte na tom konkurenčního klienta.
+> Keep the request rate human. Don't build a competing client on it.
 
-## Co s tím jde dělat
+## What changed from upstream
 
-Jakmile je agent připojený, přestane být zapisování jídel otravným proklikáváním vyhledávání. Pár vzorů, které v praxi fungují dobře:
+Upstream runs an Express app in Docker behind nginx and a Cloudflare Tunnel on a machine you keep on 24/7, with a hand-written OAuth server storing tokens in a JSON file. This fork keeps the tools and the kaloricketabulky.cz client and replaces everything around them:
 
-- **Zapisujte mluvením.** „K snídani jsem měl rohlík se šunkou a dvě vejce." Agent vyhledá potraviny, zvolí přirozené porce (*kus (55 g)* místo odhadovaných gramů) a zapíše každou položku do správného denního jídla.
+| | Upstream | This fork |
+|---|---|---|
+| Runtime | Node + Express in Docker, nginx, cloudflared | One Cloudflare Worker, no container, no server |
+| Always-on machine | Required (see its HOSTING.md) | Not needed; Cloudflare runs it on demand |
+| Cost | Your hardware and electricity | $0 on the Workers Free plan at personal volume |
+| Session cookie | In process memory | Workers KV, with an in-isolate cache; written only when it changes |
+| OAuth | Own implementation, tokens in `/data/oauth-state.json` | [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider): PKCE, dynamic client registration, Client ID Metadata Documents, refresh-token rotation, tokens stored hashed in KV |
+| Static token auth | Not available | Optional second mode for clients that send a fixed `Authorization` header |
+| Brute-force protection | express-rate-limit behind a trusted proxy hop | Cloudflare Rate Limiting binding on the consent form, keyed by the IP Cloudflare observed |
+| MCP transport | SDK Express transport, SSE | SDK fetch-standard transport, stateless, plain JSON responses |
+| MD5 for the site's login | `node:crypto` | `crypto.subtle.digest('MD5')`, a documented Workers extension |
+| State to back up | A Docker volume | None. Lose the KV namespaces and you reconnect the connector once |
 
-- **Zautomatizujte rutinu.** Pijete každý den dvě kávy s mlékem — proč je vypisovat? Pokud váš agent umí naplánované úlohy (Claude umí), řekněte mu to jednou: *„Každý den v 9:00 mi zapiš do jídelníčku dvě espressa s mlékem."* Denní konstanty se zapisují samy.
+Nothing about what the tools do, how portions are resolved, or which site endpoints are called has changed. Those parts are upstream's work; the caveats at the end are theirs too and still apply.
 
-- **Vyfoťte talíř.** Pošlete agentovi fotku oběda a zeptejte se, co na ní je. Rozpozná potraviny, odhadne reálné gramáže z obrázku, spočítá kalorie — a po potvrzení zaloguje. Odhad je odhad, ale u míchaných talířů je to lepší než nezapsat nic.
+## Tools
 
-- **Vyfoťte recept.** Vyfoťte recept z kuchařky nebo screenshot z webu a řekněte *„ulož mi to jako jídlo"*. Agent přečte suroviny, každou najde v databázi a vytvoří uložený recept — příště zalogujete jedním záznamem. Cestou můžete upravovat: *„vyměň smetanu za bílý jogurt a dej poloviční cukr."*
-
-- **Ptejte se, jak vám jde den.** „Kolik kalorií mi dnes zbývá?" přečte denní součty přímo z jídelníčku.
-
-## Nástroje
-
-| Nástroj | Účel |
+| Tool | Purpose |
 |---|---|
-| `search_food` | Najde potraviny podle českého názvu nebo 13místného EAN kódu. Vrací id potraviny, které potřebují ostatní nástroje. |
-| `get_food_portions` | Vypíše přirozené porce potraviny (`kus (55 g)`, `velký kus (60 g)`), takže „3 vejce" se zapíšou jako tři kusy, ne odhadnutá váha. |
-| `get_food_nutrition` | Kalorie a makra pro dané množství, přepočítané samotným webem. Pouze čtení. |
-| `log_food` | Zapíše záznam o jídle do jídelníčku. |
-| `get_day_summary` | Přečte denní součty. |
-| `create_meal` | Uloží recept složený z existujících potravin. |
-| `list_my_meals` | Vypíše uložené recepty s jejich id a celkovou energií. |
-| `log_meal` | Zaloguje celý uložený recept jako jeden záznam. |
-| `delete_meal` | Smaže uložený recept. |
+| `search_food` | Find foods by Czech name or 13-digit EAN barcode. Returns the food id the other tools need. |
+| `get_food_portions` | List a food's natural portion units (`kus (55 g)`, `velký kus (60 g)`) so "3 eggs" logs as three pieces rather than an estimated weight. |
+| `get_food_nutrition` | Calories and macros for a quantity, scaled by the site itself. Read-only. |
+| `log_food` | Write an eating record into the diary. |
+| `get_day_summary` | Read back a day's totals. |
+| `create_meal` | Save a recipe built from existing foods. |
+| `list_my_meals` | List saved recipes with their ids and total energy. |
+| `log_meal` | Log a whole saved recipe into the diary as one entry. |
+| `delete_meal` | Delete a saved recipe. |
 
-### Recepty
+Quantities: `amount` counts **units**, not grams. Omitting `unit_id` selects the food's base unit, grams for solids and millilitres for liquids. Pass a `unit_id` from `get_food_portions` and the count multiplies it, so 2 of `porce (250 ml)` is 500 ml.
 
-Web říká uloženému receptu *jídlo* (meal). `create_meal` ho složí
-z existujících potravin, takže „3 vejce a 200 ml mléka" je jedna znovupoužitelná
-položka místo dvou záznamů vypisovaných pokaždé znovu.
-
-Množství se řídí stejným pravidlem jako `log_food`: `amount` počítá **jednotky**,
-ne gramy. Vynecháte-li `unit_id`, použije se základní jednotka potraviny — gramy
-u pevných potravin, mililitry u tekutin — tedy to, v čem se recepty běžně píší.
-Když předáte `unit_id` z `get_food_portions`, počet ho násobí: 2 × `porce
-(250 ml)` je 500 ml. Splést se je snadné: jeden raný test zadal 100 jednotek
-`100 ml` a potichu vytvořil recept s deseti litry mléka.
-
-## Jak to funguje
-
-kaloricketabulky.cz je Spring MVC aplikace, kde každá routa odpoví i v JSON, když přidáte `?format=json` — vrací obálku `{code, data, message}`. Žádné oficiální ani dokumentované API neexistuje; endpointy byly zrekonstruovány z frontendového JavaScriptu webu. Úplná mapa je v `src/kt/client.ts`.
+## How it works
 
 ```
-Agent  ──OAuth 2.1──►  kt-mcp  ──JSESSIONID──►  kaloricketabulky.cz
-       ──MCP/HTTPS─►
+Agent ──MCP over HTTPS──► Worker ──JSESSIONID──► kaloricketabulky.cz
+                            │
+                            ├─ KT_SESSION (KV): the site's session cookie
+                            └─ OAUTH_KV  (KV): OAuth clients, grants, tokens
 ```
 
-Dvě hesla, každé hlídá něco jiného:
+Every request is self-contained. The Worker checks the caller's credential, logs in to kaloricketabulky.cz only when it has no cookie or the site rejects the one it has, and runs the tool. The cookie is cached in the isolate's memory and in KV, so a warm Worker makes no login at all and a cold one makes one. KV is eventually consistent; a stale cookie just costs one redundant login, which the client already handles as "log in again".
 
-| Tajemství | Hlídá |
+Two credentials, doing different jobs:
+
+| Secret | Guards |
 |---|---|
-| `MCP_AUTH_PASSWORD` | Kdo smí tento server připojit k agentovi. Zadáváte ho jednou v prohlížeči při OAuth souhlasu. |
-| `KT_PASSWORD` | Účet na kaloricketabulky.cz, do kterého nástroje zapisují. Nikdy neopouští server. |
+| `MCP_AUTH_PASSWORD` or `MCP_AUTH_TOKEN` | Who may connect an agent to this server |
+| `KT_EMAIL` / `KT_PASSWORD` | The kaloricketabulky.cz account the tools write to. Never leaves the Worker |
 
-### Co se stane při připojení
+### Two ways to authenticate an agent
 
-Žádný token ručně nevytváříte ani nekopírujete — OAuth to udělá za vás:
+**OAuth mode**, enabled by setting `MCP_AUTH_PASSWORD`. This is what claude.ai's custom connectors use by default and it works on every plan. When you add the connector, Claude registers itself with the Worker, opens a consent page in your browser, you type the passphrase once, and the Worker issues Claude an access token plus a refresh token. Tokens are random, stored only as hashes in `OAUTH_KV`, and rotate on refresh.
 
-1. Do prostředí serveru (`.env`) vložíte svůj **login na kaloricketabulky.cz**
-   (`KT_EMAIL` / `KT_PASSWORD`) a **přístupovou frázi, kterou si vymyslíte**
-   (`MCP_AUTH_PASSWORD`). Přihlašovací údaje ke kalorickým tabulkám zůstávají
-   na vašem serveru; agent je nikdy nevidí.
-2. V agentovi přidáte URL konektoru, `https://<your-host>/mcp`. Agent se u
-   vašeho serveru zaregistruje sám (dynamická registrace klientů).
-3. Otevře se stránka v prohlížeči — obrazovka souhlasu vašeho serveru. Jednou
-   zadáte `MCP_AUTH_PASSWORD`.
-4. Váš server vygeneruje unikátní náhodný přístupový token a předá ho agentovi,
-   který si ho uloží a automaticky obnovuje. Od té chvíle je každé volání
-   nástroje ověřené tímto tokenem.
+**Token mode**, enabled by setting `MCP_AUTH_TOKEN`. The agent sends `Authorization: Bearer <token>` on every request and the Worker compares it in constant time. Use it with Claude Code, with any MCP client that can send a fixed header, or with claude.ai's **Request headers** option. That option is in a limited beta at the time of writing, so check whether your account shows it before relying on it; OAuth mode is the safe default.
 
-Protože si každý provozuje vlastní instanci, každý token patří jen jemu: váš
-server zná jen váš jídelníček a tokeny vydává jen tomu, kdo zná vaši frázi.
-Mezi instalacemi se nesdílí nic a žádná centrální služba neexistuje.
+Set one or both. With both set, a request carrying the static token skips OAuth; anything else goes through OAuth.
 
-## Lokální vývoj
+## Setup on Cloudflare
+
+You need a Cloudflare account (free), Node.js 22 or newer, and this repository cloned. Everything below runs through `npx wrangler`, so nothing is installed globally. About fifteen minutes.
+
+### 1. Install and sign in
 
 ```bash
 npm install
-cp .env.example .env      # doplňte své údaje
-npm run build
-npm test
-
-set -a; source .env; set +a
-PUBLIC_URL=https://localhost:8092 node dist/index.js
+npx wrangler login
 ```
 
-`GET /healthz` vrací výsledný veřejný MCP endpoint — nejrychlejší způsob, jak ověřit, že `PUBLIC_URL` je opravdu to, co si myslíte.
+`wrangler login` opens a browser to authorize the CLI against your Cloudflare account.
 
-## Vlastní hosting
-
-> ⚠️ Server by měl běžet nepřetržitě — na uspávaném PC selžou naplánované
-> zápisy. Podrobnosti a doporučení v [HOSTING.md](HOSTING.md).
-
-Referenční nasazení používá Docker, nginx a Cloudflare Tunnel zdarma — na hostiteli ani routeru se neotvírá žádný příchozí port. Funguje ale cokoli jiného, co před kontejner postaví HTTPS hostname; tunel je jen nejlevnější bezpečná výchozí volba.
-
-Cesta požadavku:
-
-```
-Cloudflare → cloudflared (host network) → 127.0.0.1:80 → nginx → kt-mcp:8092
-```
-
-nginx poslouchá jen na loopbacku hostitele a `cloudflared` se připojuje ven.
-Konfigurace nginx (`deploy/nginx.conf.template`) vypíná proxy buffering — bez
-toho by Server-Sent Events čekaly na konec streamu a volání nástrojů by se
-zasekávala.
-
-**1. Vytvořte tunel** (jednou), v Cloudflare Zero Trust dashboardu → Networks → Tunnels:
-
-- Vytvořte tunel, zkopírujte **tunnel token**.
-- Přidejte public hostname se službou **`HTTP`** → **`localhost:80`**.
-  `cloudflared` ze stacku běží v host network módu, takže `localhost:80` je
-  nginx publikovaný na loopbacku hostitele. Obyčejné `http`, protože TLS
-  ukončuje tunel.
-
-Zvolený hostname je dále označován `<your-host>`; funguje jakákoli doména na
-vašem Cloudflare účtu a nic v kódu na ni není vázané.
-
-**2. Sestavte image**, z tohoto adresáře:
+### 2. Create the two KV namespaces
 
 ```bash
-docker compose build
+npx wrangler kv namespace create KT_SESSION
+npx wrangler kv namespace create OAUTH_KV
 ```
 
-**3. Nasaďte stack.** `deploy/stack.yml` je runtime compose soubor (funguje samostatně i jako Portainer stack); nastavte tyto proměnné prostředí:
+Each command prints a snippet containing an `id`. Put the two ids into `wrangler.jsonc`, replacing the placeholders:
 
-| Proměnná | Hodnota |
-|---|---|
-| `KT_EMAIL` / `KT_PASSWORD` | Váš login na kaloricketabulky.cz |
-| `MCP_HOSTNAME` | `<your-host>` — holý hostname bez schématu. nginx si ho při startu doplní do konfigurace |
-| `MCP_AUTH_PASSWORD` | Dlouhá přístupová fráze, kterou si zvolíte (min. 12 znaků) |
-| `PUBLIC_URL` | `https://<your-host>` — musí přesně odpovídat hostname tunelu |
-| `TUNNEL_TOKEN` | Z kroku 1 |
+```jsonc
+"kv_namespaces": [
+  { "binding": "KT_SESSION", "id": "<id from the first command>" },
+  { "binding": "OAUTH_KV", "id": "<id from the second command>" }
+]
+```
 
-Udržujte `docker-compose.yml` a `deploy/stack.yml` v souladu — první sestavuje image, druhý ho spouští.
+Keep the `binding` names exactly as they are; the code looks them up by name.
 
-**4. Ověřte nasazení**, než ho připojíte k agentovi:
+### 3. Deploy
 
 ```bash
-./scripts/verify-deployment.sh https://<your-host>
+npm run deploy
 ```
 
-**5. Připojte agenta.** V Claudovi: Settings → Connectors → Add custom connector → zadejte `https://<your-host>/mcp`. Agent se sám zaregistruje, otevře stránku souhlasu a vy jednou zadáte `MCP_AUTH_PASSWORD`. Ostatní MCP klienti mají vlastní postup „přidat vzdálený MCP server" se stejnou URL.
+Wrangler bundles `src/index.ts`, uploads it, and prints the URL, something like `https://kt-mcp.<your-subdomain>.workers.dev`. On a brand-new account it first asks to enable your `workers.dev` subdomain; say yes.
 
-### Pozdější změna domény
+The Worker answers every request with a 500 until the secrets are set, which is the next step. That is deliberate: it tells you exactly which secret is missing instead of failing inside a tool call.
 
-Hostname není zapečený v image — shodovat se musí jen `PUBLIC_URL` a public
-hostname tunelu. Přesun:
+If the deploy complains about the `ratelimits` binding, remove that block from `wrangler.jsonc` and deploy again. The code treats the limiter as optional. Everything else is on the free plan: Workers (100,000 requests a day), KV (100,000 reads and 1,000 writes a day), and Workers Logs.
 
-1. Přesměrujte public hostname tunelu na novou doménu (nebo vytvořte nový tunel
-   a vyměňte `TUNNEL_TOKEN`).
-2. Aktualizujte `PUBLIC_URL` na stacku a znovu nasaďte.
-3. Znovu spusťte ověřovací skript, pak v agentovi konektor odeberte a přidejte
-   znovu.
+### 4. Set the secrets
 
-Krok 3 je nutný: `PUBLIC_URL` je OAuth issuer a identifikátor zdroje podle
-RFC 8707, takže tokeny vydané pod starým hostname jsou po přesunu správně
-odmítnuty.
+```bash
+npx wrangler secret put KT_EMAIL
+npx wrangler secret put KT_PASSWORD
+npx wrangler secret put MCP_AUTH_PASSWORD
+```
 
-### Zaseklí, nebo nemáte kde hostovat?
+Each command prompts for the value and stores it encrypted on Cloudflare. `MCP_AUTH_PASSWORD` must be at least 12 characters; make it long and random, since the consent page is reachable from the whole internet.
 
-Pokud při vlastním hostování narazíte, založte [GitHub issue](../../issues) —
-rád pomůžu, od toho issue tracker je.
+If you also want token mode:
 
-Vlastní hosting potřebuje stroj, který běží nepřetržitě (viz
-[HOSTING.md](HOSTING.md)), a účet u Cloudflare. Pokud nemáte kde server
-provozovat, ozvěte se na **kt-mcp@stanwhy.me** a něco vymyslíme — jen počítejte
-s tím, že provoz privátní instance znamená reálné náklady na server, které by
-šly za vámi.
+```bash
+openssl rand -base64 32          # generate a token, keep it somewhere safe
+npx wrangler secret put MCP_AUTH_TOKEN
+```
 
-## Autentizace
+Secrets apply to the running Worker without another deploy.
 
-Server je sám sobě OAuth 2.1 autorizačním serverem a implementuje, co MCP specifikace od chráněného zdroje vyžaduje:
+### 5. Verify before connecting anything
 
-- `/.well-known/oauth-protected-resource/mcp` — RFC 9728 discovery
-- `/.well-known/oauth-authorization-server` — RFC 8414 discovery
-- `/authorize`, `/token`, `/register`, `/revoke` — authorization code + PKCE, dynamická registrace klientů, rotace refresh tokenů
+```bash
+./scripts/verify-deployment.sh https://kt-mcp.<your-subdomain>.workers.dev
+```
 
-Přístupové tokeny žijí 30 dní a persistují se do `/data` na volume, takže redeploy nevynutí nové připojení konektoru.
+It checks that the Worker is reachable, that `/mcp` refuses unauthenticated calls, that OAuth discovery documents are served, and that the transport rejects what it should. With `MCP_AUTH_TOKEN` exported in your shell it also lists the tools through token mode.
 
-### Co chrání přístupová fráze
+To exercise the complete OAuth flow with curl, the way a connector would:
 
-`MCP_AUTH_PASSWORD` je jediná cesta k získání tokenu. Každý požadavek na `/mcp`
-vyžaduje platný bearer token a tokeny vydává výhradně formulář souhlasu po
-porovnání s frází v konstantním čase. Ověřeno auditem
-(`scripts/security-audit.sh`): neautentizovaná volání i volání s padělaným
-tokenem jsou odmítnuta, vymyšlené autorizační kódy a refresh tokeny jsou
-odmítnuty, žádný veřejný endpoint nevydává credential a žádná variace metody či
-cesty se k nástrojům bez tokenu nedostane.
+```bash
+MCP_AUTH_PASSWORD=… ./scripts/smoke-oauth.sh https://kt-mcp.<your-subdomain>.workers.dev
+```
 
-Dvě věci jsou veřejné záměrně a bezpečně: OAuth discovery dokumenty (vyžaduje je
-specifikace) a dynamická registrace klientů. Registrace klienta útočníkovi nic
-nedá — token bez fráze stále nezíská.
+It registers one throwaway client, loads the consent page, proves a wrong passphrase is refused, exchanges a code with PKCE, lists the tools with the token, and refreshes it. It never touches your diary.
 
-Hrubou sílu omezuje limit 100 požadavků za 15 minut na `/authorize`. Limiter
-klíčuje podle IP klienta, proto nginx **přepisuje** `X-Forwarded-For` ověřenou
-hlavičkou `CF-Connecting-IP` od Cloudflare a aplikace věří přesně jednomu proxy
-hopu. Připojování k hlavičce od klienta — nebo `trust proxy: true` — by útočníkovi
-dovolilo vyrobit si nový bucket pro každý požadavek a limit by přestal existovat.
+### 6. Connect Claude
 
-Zbytková rizika, o kterých je dobré vědět: kdokoli s frází má plný přístup;
-jednotlivé tokeny nelze odvolat jinak než smazáním `/data/oauth-state.json`;
-a protože registrace klientů je otevřená, phishingový odkaz na stránku souhlasu
-by mohl frázi zachytit, kdybyste ji tam zadali — před autorizací zkontrolujte
-jméno klienta zobrazené ve formuláři.
+In claude.ai, go to **Customize > Connectors**, click **Add custom connector**, and enter:
 
-## Omezení
+- **Name**: anything, for example `Kalorické tabulky`
+- **MCP server URL**: `https://kt-mcp.<your-subdomain>.workers.dev/mcp`
 
-- **Nedokumentovaný upstream.** Dine4Fit tu nic negarantuje; refactoring frontendu může bez varování změnit tvary odpovědí. Klient při čemkoli nečekaném vyhodí chybu místo hádání, takže se rozbití projeví hlasitou chybou, ne špatným počtem kalorií.
-- **`md5(hesla)` je ekvivalent hesla.** Web hashuje heslo na klientovi, hash je tedy stejně citlivý jako heslo samotné. Podle toho s `KT_PASSWORD` zacházejte.
-- **Jeden účet na instanci.** Server se přihlašuje k jedinému účtu kaloricketabulky.cz. Dva lidé, dva kontejnery.
-- **Osobní použití.** Automatizace zápisů do vlastního účtu je mnohem měkčí pozice než hromadný scraping, ale pořád je mimo cokoli, co Dine4Fit posvětil. Držte frekvenci požadavků na lidské úrovni a nestavte na tom konkurenčního klienta.
-- **Čtení jednotlivých záznamů dne** je nejméně ověřený endpoint; `get_day_summary` posílá odpověď webu beze změny dál, protože její tvar není plně zdokumentovaný.
-- **Část porce receptu zalogovat nejde.** Formulář pro přidání jídla sice nabízí `count` proti pseudo-jednotkám porce, procenta a gramy, ale server ho ignoruje a zaloguje vždy celý recept — měřeno na receptu o 249 kcal přidalo 0,5 porce i polovina váhy plných 249. `log_meal` proto nemá argument `portions`; když snědená byla jen část receptu, zalogujte suroviny jednotlivě přes `log_food`.
+If the dialog asks for authentication settings, choose **Sign in now** (or **Sign in when needed**) and, under **OAuth client**, **Use Claude's published identity**. **Register automatically** works too. Click **Add**. A browser tab opens the Worker's consent page: check that it says *Requested by Claude*, type your `MCP_AUTH_PASSWORD`, and click **Authorize**. Claude now holds a token and refreshes it on its own; you type the passphrase once.
 
-## Licence
+The connector is then available in the web app, the desktop app, and the mobile apps, and in scheduled tasks.
 
-[MIT](LICENSE). Databáze potravin a služba kaloricketabulky.cz patří Dine4Fit, a.s. — tato licence pokrývá pouze kód v tomto repozitáři.
+For token mode in claude.ai (if your account shows the option): choose **No sign-in**, open **Request headers**, pick `authorization`, and enter the value as `Bearer <your token>` including the word `Bearer` and the space.
+
+For Claude Code:
+
+```bash
+claude mcp add --transport http kt https://kt-mcp.<your-subdomain>.workers.dev/mcp \
+  --header "Authorization: Bearer <your token>"
+```
+
+Without `--header`, Claude Code starts the OAuth flow instead, which also works.
+
+### 7. Optional: a custom domain
+
+Any domain on your Cloudflare account can front the Worker. Add to `wrangler.jsonc`:
+
+```jsonc
+"routes": [{ "pattern": "kt.example.com", "custom_domain": true }]
+```
+
+and deploy. Nothing in the code is tied to a hostname: the OAuth issuer and resource identifier are derived from the request, so each hostname is its own issuer. Tokens issued under one hostname are, correctly, not valid under another, so after moving to a custom domain remove and re-add the connector in Claude.
+
+## Local development
+
+```bash
+cp .dev.vars.example .dev.vars    # fill in values; this file is git-ignored
+npm run dev                       # wrangler dev on http://localhost:8787
+```
+
+`wrangler dev` simulates KV and the rate limiter locally; no Cloudflare account is needed for it. The two scripts above accept `http://127.0.0.1:8787`. Tools that only read the public food database (`search_food`, `get_food_portions`, `get_food_nutrition`) work with fake `KT_*` values; the rest need a real login.
+
+```bash
+npm run typecheck   # tsc against the Workers types
+npm test            # unit tests for parsing, hashing, the session cache
+npm run check       # both, plus a dry-run bundle
+```
+
+## Operating it
+
+- **Logs**: `npx wrangler tail`, or the Workers Logs page in the dashboard. Tool calls are logged with their arguments (food names, amounts), never credentials or tokens.
+- **Rotate the passphrase or token**: `wrangler secret put` again. Existing OAuth tokens stay valid; to cut them off, delete the `OAUTH_KV` namespace's contents (`npx wrangler kv key list --binding OAUTH_KV`, then `delete`), or delete and recreate the namespace, then reconnect the connector.
+- **The site changed something**: tool calls fail loudly with the response the site sent, by design. Fix the client in `src/kt/client.ts`, `npm run deploy`.
+- **Limits that matter**: a tool call is one Worker request and one to three requests to kaloricketabulky.cz; the free plan allows 100,000 Worker requests a day and 50 outbound requests per invocation. KV sees one read per tool call and a write only on login. None of this is close at personal volume.
+
+## Security notes
+
+- `MCP_AUTH_PASSWORD` is the only way to obtain an OAuth token, and `MCP_AUTH_TOKEN` the only other way in. Both are compared in constant time. Anyone holding either has full access to the diary.
+- Discovery documents and client registration are public by design; the spec requires them. Registering a client gets an attacker no further.
+- The consent form is rate-limited to 10 attempts per minute per client IP per Cloudflare location, approximately. That is a speed bump, not a wall: the real defence is a long random passphrase.
+- Because registration is open, a phishing link to the consent page could capture the passphrase if you typed it there. The page names the client and, for Claude's published identity, the domain that published it. Authorize only when you just started connecting from Claude.
+- Your kaloricketabulky.cz password is stored as a Worker secret on Cloudflare. If you would rather not trust Cloudflare with it, this is not the deployment for you; upstream's self-hosted version is.
+- The Worker rejects any request to `/mcp` whose `Origin` header is present and not its own origin, as the MCP spec asks, against DNS rebinding.
+- MD5 of the password is what the site's own login form sends, so the hash is password-equivalent. It is computed per login and never stored.
+
+## Caveats
+
+- **Undocumented upstream.** Dine4Fit guarantees nothing here; a frontend refactor could change payload shapes without warning. The client throws on anything unexpected rather than guessing.
+- **Egress.** Requests to kaloricketabulky.cz now come from Cloudflare's network. The first deployed `search_food` call tells you whether the site accepts that.
+- **One account per Worker.** Two people, two Workers (they can share a Cloudflare account).
+- **Personal use.** Automating entry into your own account is a far softer position than bulk scraping, but it is still outside anything Dine4Fit has sanctioned.
+- **`get_day_summary`** passes the site's response through unmodified because its shape isn't fully documented.
+- **Partial portions of a recipe cannot be logged.** The site ignores the count on the meal-add form and logs the whole recipe. Log the ingredients individually with `log_food` when only part of a recipe was eaten.
+
+## License
+
+[MIT](LICENSE). The food database and the kaloricketabulky.cz service belong to Dine4Fit, a.s.; this licence covers only the code in this repository.
