@@ -182,6 +182,7 @@ export class KtClient {
 
   private async request(path: string, init: { method?: string; body?: unknown } = {}): Promise<RawResponse> {
     if (this.cookie === undefined) this.cookie = await this.sessions.load();
+    const hadCookie = this.cookie !== null;
 
     const headers: Record<string, string> = {
       'User-Agent': UA,
@@ -201,7 +202,14 @@ export class KtClient {
     const setCookies = response.headers.getSetCookie?.() ?? [];
     const jsession = setCookies.find(c => c.startsWith('JSESSIONID='));
     const setCookie = jsession ? (jsession.split(';')[0] ?? null) : null;
-    if (setCookie) this.cookie = setCookie;
+    if (setCookie) {
+      this.cookie = setCookie;
+      // The site replaced a session we already held (Spring rotates ids on
+      // several paths): persist it so other isolates do not keep the dead one.
+      // A cookie issued when we held none is an anonymous session; login()
+      // persists its own result, and anonymous ones are not worth a KV write.
+      if (hadCookie) await this.sessions.save(setCookie);
+    }
 
     // Spring Security answers unauthenticated /user/** with a 302 to /login.
     const location = response.headers.get('location') ?? '';
@@ -265,8 +273,6 @@ export class KtClient {
       result = await this.request(path, init);
       if (result.redirectedToLogin) throw new KtError(`${path}: still unauthenticated after re-login`);
     }
-    // The site rotated the session on an authenticated call: keep the new one.
-    if (result.setCookie) await this.sessions.save(result.setCookie);
     return this.parseEnvelope(result.text, path);
   }
 

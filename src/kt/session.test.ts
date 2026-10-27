@@ -7,17 +7,16 @@ class FakeKv implements KvLike {
   gets = 0;
   puts: Array<{ key: string; value: string; ttl?: number }> = [];
   failPut = false;
+  failGet = false;
   async get(key: string) {
     this.gets++;
+    if (this.failGet) throw new Error('kv down');
     return this.data.get(key) ?? null;
   }
   async put(key: string, value: string, options?: { expirationTtl?: number }) {
     if (this.failPut) throw new Error('kv down');
     this.puts.push({ key, value, ttl: options?.expirationTtl });
     this.data.set(key, value);
-  }
-  async delete(key: string) {
-    this.data.delete(key);
   }
 }
 
@@ -68,11 +67,15 @@ test('a failed KV write keeps the cookie in memory instead of throwing', async (
   assert.equal(kv.data.size, 0);
 });
 
-test('clear forgets both copies', async () => {
+test('a failed KV read is treated as "no cookie" so the client logs in', async () => {
   const kv = new FakeKv();
+  kv.failGet = true;
   const store = new KvSessionStore(kv);
-  await store.save('JSESSIONID=gone');
-  await store.clear();
-  assert.equal(await store.load(), null);
-  assert.equal(kv.data.has(SESSION_KEY), false);
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    assert.equal(await store.load(), null);
+  } finally {
+    console.warn = warn;
+  }
 });

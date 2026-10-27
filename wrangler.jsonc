@@ -17,10 +17,11 @@
     { "binding": "OAUTH_KV", "id": "REPLACE_WITH_OAUTH_KV_NAMESPACE_ID" }
   ],
 
-  // Slows down passphrase guessing on the OAuth consent page: 10 POSTs per
-  // minute per client IP, per Cloudflare location. Optional — the code skips
-  // the check when the binding is absent — so remove this block if your
-  // account cannot use the Rate Limiting binding.
+  // Slows down passphrase guessing and registration spam on /authorize,
+  // /register and /token: 10 requests per minute per client IP, per Cloudflare
+  // location. OAuth mode refuses to run without it; to override that, add
+  //   "vars": { "ALLOW_UNLIMITED_CONSENT_ATTEMPTS": "true" }
+  // and accept that the consent page can then be brute-forced.
   "ratelimits": [
     { "name": "AUTH_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
   ]

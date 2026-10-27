@@ -33,7 +33,7 @@ Upstream runs an Express app in Docker behind nginx and a Cloudflare Tunnel on a
 | Session cookie | In process memory | Workers KV, with an in-isolate cache; written only when it changes |
 | OAuth | Own implementation, tokens in `/data/oauth-state.json` | [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider): PKCE, dynamic client registration, Client ID Metadata Documents, refresh-token rotation, tokens stored hashed in KV |
 | Static token auth | Not available | Optional second mode for clients that send a fixed `Authorization` header |
-| Brute-force protection | express-rate-limit behind a trusted proxy hop | Cloudflare Rate Limiting binding on the consent form, keyed by the IP Cloudflare observed |
+| Brute-force protection | express-rate-limit behind a trusted proxy hop | Cloudflare Rate Limiting binding on the consent, registration and token endpoints, keyed by the IP Cloudflare observed |
 | MCP transport | SDK Express transport, SSE | SDK fetch-standard transport, stateless, plain JSON responses |
 | MD5 for the site's login | `node:crypto` | `crypto.subtle.digest('MD5')`, a documented Workers extension |
 | State to back up | A Docker volume | None. Lose the KV namespaces and you reconnect the connector once |
@@ -65,7 +65,7 @@ Agent ──MCP over HTTPS──► Worker ──JSESSIONID──► kaloricketa
                             └─ OAUTH_KV  (KV): OAuth clients, grants, tokens
 ```
 
-Every request is self-contained. The Worker checks the caller's credential, logs in to kaloricketabulky.cz only when it has no cookie or the site rejects the one it has, and runs the tool. The cookie is cached in the isolate's memory and in KV, so a warm Worker makes no login at all and a cold one makes one. KV is eventually consistent; a stale cookie just costs one redundant login, which the client already handles as "log in again".
+Every request is self-contained. The Worker checks the caller's credential, logs in to kaloricketabulky.cz only when it has no cookie or the site rejects the one it has, and runs the tool. The cookie is cached in the isolate's memory and in KV: a warm isolate makes no login at all, a cold one reads KV once and logs in only if the stored cookie is missing or rejected. KV is eventually consistent; a stale cookie just costs one redundant login, which the client already handles as "log in again".
 
 Two credentials, doing different jobs:
 
@@ -121,9 +121,9 @@ npm run deploy
 
 Wrangler bundles `src/index.ts`, uploads it, and prints the URL, something like `https://kt-mcp.<your-subdomain>.workers.dev`. On a brand-new account it first asks to enable your `workers.dev` subdomain; say yes.
 
-The Worker answers every request with a 500 until the secrets are set, which is the next step. That is deliberate: it tells you exactly which secret is missing instead of failing inside a tool call.
+The Worker answers every request with a generic 500 until the secrets are set, which is the next step. `npx wrangler tail` shows which secret or binding it is missing; nothing else is served in that state.
 
-If the deploy complains about the `ratelimits` binding, remove that block from `wrangler.jsonc` and deploy again. The code treats the limiter as optional. Everything else is on the free plan: Workers (100,000 requests a day), KV (100,000 reads and 1,000 writes a day), and Workers Logs.
+Everything the config asks for is on the free plan: Workers (100,000 requests a day), KV (100,000 reads and 1,000 writes a day), Workers Logs, and the Rate Limiting binding. OAuth mode refuses to run without the limiter, because the consent page is a public passphrase prompt. If your account cannot create the binding, either use token mode or add `"vars": { "ALLOW_UNLIMITED_CONSENT_ATTEMPTS": "true" }` to `wrangler.jsonc` and accept that the passphrase can then be guessed at Workers speed.
 
 ### 4. Set the secrets
 
@@ -190,7 +190,7 @@ Any domain on your Cloudflare account can front the Worker. Add to `wrangler.jso
 "routes": [{ "pattern": "kt.example.com", "custom_domain": true }]
 ```
 
-and deploy. Nothing in the code is tied to a hostname: the OAuth issuer and resource identifier are derived from the request, so each hostname is its own issuer. Tokens issued under one hostname are, correctly, not valid under another, so after moving to a custom domain remove and re-add the connector in Claude.
+and deploy. Nothing in the code is tied to a hostname: the OAuth issuer and resource identifier are derived from the request, so each hostname is its own issuer and both keep working side by side. Tokens issued under one hostname are, correctly, not valid under another, so after moving to a custom domain remove and re-add the connector in Claude. Once the custom domain works, add `"workers_dev": false` so only one hostname is public.
 
 ## Local development
 
@@ -210,18 +210,18 @@ npm run check       # both, plus a dry-run bundle
 ## Operating it
 
 - **Logs**: `npx wrangler tail`, or the Workers Logs page in the dashboard. Tool calls are logged with their arguments (food names, amounts), never credentials or tokens.
-- **Rotate the passphrase or token**: `wrangler secret put` again. Existing OAuth tokens stay valid; to cut them off, delete the `OAUTH_KV` namespace's contents (`npx wrangler kv key list --binding OAUTH_KV`, then `delete`), or delete and recreate the namespace, then reconnect the connector.
+- **Rotate the passphrase or token**: `wrangler secret put` again. Existing OAuth tokens stay valid. To cut them all off, empty `OAUTH_KV`: `npx wrangler kv key list --remote --binding OAUTH_KV` shows the keys and `npx wrangler kv key delete --remote --binding OAUTH_KV <key>` removes one; or delete the namespace in the dashboard, create a new one, update its id in `wrangler.jsonc`, deploy, and reconnect the connector. Without `--remote`, wrangler talks to the local dev store.
 - **The site changed something**: tool calls fail loudly with the response the site sent, by design. Fix the client in `src/kt/client.ts`, `npm run deploy`.
-- **Limits that matter**: a tool call is one Worker request and one to three requests to kaloricketabulky.cz; the free plan allows 100,000 Worker requests a day and 50 outbound requests per invocation. KV sees one read per tool call and a write only on login. None of this is close at personal volume.
+- **Limits that matter**: a tool call is one Worker request and one to three requests to kaloricketabulky.cz; the free plan allows 100,000 Worker requests a day and 50 outbound requests per invocation. KV is read once per isolate and written when the Worker logs in or the site rotates the session. None of this is close at personal volume.
 
 ## Security notes
 
 - `MCP_AUTH_PASSWORD` is the only way to obtain an OAuth token, and `MCP_AUTH_TOKEN` the only other way in. Both are compared in constant time. Anyone holding either has full access to the diary.
 - Discovery documents and client registration are public by design; the spec requires them. Registering a client gets an attacker no further.
-- The consent form is rate-limited to 10 attempts per minute per client IP per Cloudflare location, approximately. That is a speed bump, not a wall: the real defence is a long random passphrase.
+- `/authorize`, `/register` and `/token` are rate-limited to 10 requests per minute per client IP per Cloudflare location, approximately. That is a speed bump, not a wall: the real defence is a long random passphrase. The same limit bounds how fast an anonymous caller can make the Worker write to KV (every registration and consent page is a record), which on the free plan is a quota of 1,000 writes a day shared by the whole account; a distributed attacker could still exhaust it, after which token refreshes fail until midnight UTC.
 - Because registration is open, a phishing link to the consent page could capture the passphrase if you typed it there. The page names the client and, for Claude's published identity, the domain that published it. Authorize only when you just started connecting from Claude.
 - Your kaloricketabulky.cz password is stored as a Worker secret on Cloudflare. If you would rather not trust Cloudflare with it, this is not the deployment for you; upstream's self-hosted version is.
-- The Worker rejects any request to `/mcp` whose `Origin` header is present and not its own origin, as the MCP spec asks, against DNS rebinding.
+- Unlike upstream, the Worker does not check the `Origin` header on `/mcp`. That check defends local servers that rely on ambient credentials against DNS rebinding; this is a public HTTPS host that accepts only a bearer token, so a page on another origin gains nothing from it, and the check would break browser-based MCP clients, which the OAuth provider serves with CORS headers.
 - MD5 of the password is what the site's own login form sends, so the hash is password-equivalent. It is computed per login and never stored.
 
 ## Caveats

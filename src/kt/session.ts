@@ -7,16 +7,15 @@
  * replaced. That is harmless here because the client treats a login redirect
  * as "log in again", so the worst case is one redundant login.
  *
- * Writes happen only when the cookie actually changes (a login, or the site
- * rotating the session), which keeps well inside the free plan's 1,000 KV
- * writes per day.
+ * KV is read once per isolate and written only when the cookie actually
+ * changes (a login, or the site rotating the session), which keeps well
+ * inside the free plan's 1,000 KV writes per day.
  */
 
 /** The subset of a KV namespace this store needs; lets tests pass a fake. */
 export interface KvLike {
   get(key: string): Promise<string | null>;
   put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
-  delete(key: string): Promise<void>;
 }
 
 export interface SessionStore {
@@ -24,8 +23,6 @@ export interface SessionStore {
   load(): Promise<string | null>;
   /** Remember a cookie the site just issued. */
   save(cookie: string): Promise<void>;
-  /** Forget the cookie, so the next call logs in. */
-  clear(): Promise<void>;
 }
 
 export const SESSION_KEY = 'kt-session-cookie';
@@ -56,8 +53,17 @@ export class KvSessionStore implements SessionStore {
   ) {}
 
   async load(): Promise<string | null> {
+    // Deliberately never re-read within an isolate: a cookie another isolate
+    // refreshed is only adopted after a redirect-to-login here, which costs
+    // one extra login per isolate and nothing else.
     if (memory !== undefined) return memory;
-    memory = await this.kv.get(SESSION_KEY);
+    try {
+      memory = await this.kv.get(SESSION_KEY);
+    } catch (error) {
+      // A KV outage must not take the tools down: fall back to logging in.
+      console.warn('[session] KV read failed; logging in instead:', error);
+      memory = null;
+    }
     return memory;
   }
 
@@ -73,12 +79,4 @@ export class KvSessionStore implements SessionStore {
     }
   }
 
-  async clear(): Promise<void> {
-    memory = null;
-    try {
-      await this.kv.delete(SESSION_KEY);
-    } catch (error) {
-      console.warn('[session] KV delete failed:', error);
-    }
-  }
 }

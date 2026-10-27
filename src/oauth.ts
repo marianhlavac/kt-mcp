@@ -17,7 +17,7 @@ import {
   type OAuthResourceContext,
 } from '@cloudflare/workers-oauth-provider';
 import { secretMatches } from './auth.js';
-import { ConfigError, loadConfig, type Env } from './env.js';
+import type { Env } from './env.js';
 
 /** The one scope this server knows. Granted in full on every consent. */
 export const SCOPE = 'kt:diary';
@@ -35,13 +35,15 @@ export type McpHandler = (request: Request, env: Env, ctx: ExecutionContext) => 
 /**
  * The provider's issuer and resource identifier are the deployment's own
  * origin, which is only known from the request. Instances are cached per
- * origin; a Worker sees one or two (workers.dev and a custom domain).
+ * origin; a Worker sees one or two (workers.dev and a custom domain). The
+ * passphrase is captured alongside: changing a secret deploys a new version
+ * and retires this isolate, but the cache checks it anyway.
  */
-const providers = new Map<string, OAuthProvider<Env>>();
+const providers = new Map<string, { passphrase: string; provider: OAuthProvider<Env> }>();
 
-export function providerFor(origin: string, handleMcp: McpHandler): OAuthProvider<Env> {
+export function providerFor(origin: string, passphrase: string, handleMcp: McpHandler): OAuthProvider<Env> {
   const existing = providers.get(origin);
-  if (existing) return existing;
+  if (existing && existing.passphrase === passphrase) return existing.provider;
   if (providers.size >= 8) providers.clear();
 
   const provider = new OAuthProvider<Env>({
@@ -53,7 +55,7 @@ export function providerFor(origin: string, handleMcp: McpHandler): OAuthProvide
         return handleMcp(request, env, ctx);
       },
     },
-    defaultHandler: { fetch: handleAuthorization },
+    defaultHandler: { fetch: (request, env) => handleAuthorization(request, env, passphrase) },
     authorizeEndpoint: '/authorize',
     tokenEndpoint: '/token',
     clientRegistrationEndpoint: '/register',
@@ -70,36 +72,20 @@ export function providerFor(origin: string, handleMcp: McpHandler): OAuthProvide
     refreshTokenTTL: REFRESH_TOKEN_TTL_SECONDS,
     refreshTokenIdleTTL: REFRESH_TOKEN_TTL_SECONDS,
   });
-  providers.set(origin, provider);
+  providers.set(origin, { passphrase, provider });
   return provider;
 }
 
 /**
  * Everything the provider does not own itself: only `/authorize`. Discovery
- * documents, `/token`, `/register` and `/mcp` never reach this handler.
+ * documents, `/token`, `/register` and `/mcp` never reach this handler. The
+ * entrypoint has already validated the configuration and rate-limited the
+ * request by client IP.
  */
-async function handleAuthorization(request: Request, env: Env): Promise<Response> {
+async function handleAuthorization(request: Request, env: Env, passphrase: string): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname !== '/authorize') {
     return new Response('Not found', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
-  }
-
-  let passphrase: string;
-  try {
-    const config = loadConfig(env);
-    if (!config.authPassword) {
-      return new Response('OAuth is not enabled on this server (MCP_AUTH_PASSWORD is not set).', {
-        status: 404,
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-      });
-    }
-    passphrase = config.authPassword;
-  } catch (error) {
-    if (error instanceof ConfigError) {
-      console.error('[config]', error.message);
-      return new Response(`Server misconfigured: ${error.message}`, { status: 500, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
-    }
-    throw error;
   }
 
   const oauth = env.OAUTH_PROVIDER;
@@ -114,19 +100,13 @@ async function handleAuthorization(request: Request, env: Env): Promise<Response
     }
 
     if (request.method === 'POST') {
-      if (env.AUTH_RATE_LIMITER) {
-        // Keyed by the client IP Cloudflare observed; a caller cannot forge it.
-        const key = request.headers.get('cf-connecting-ip') ?? 'unknown';
-        const { success } = await env.AUTH_RATE_LIMITER.limit({ key });
-        if (!success) {
-          return new Response('Too many attempts. Wait a minute and try again.', {
-            status: 429,
-            headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '60' },
-          });
-        }
+      // Rate limiting happened in the entrypoint, before the provider.
+      let form: FormData;
+      try {
+        form = await request.formData();
+      } catch {
+        return new Response('Expected a form submission.', { status: 400, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
       }
-
-      const form = await request.formData();
       const handle = String(form.get('handle') ?? '');
       const decision = form.get('decision');
       const password = form.get('password');
@@ -136,6 +116,11 @@ async function handleAuthorization(request: Request, env: Env): Promise<Response
         return new Response(null, { status: 302, headers: denied.headers });
       }
 
+      // The passphrase is checked before the handle on purpose: approveConsent
+      // consumes the handle, so checking it first would make every typo restart
+      // the flow from Claude. The cost is that a wrong guess is distinguishable
+      // from a missing handle without opening a consent transaction, which is
+      // why the entrypoint rate-limits this endpoint by client IP.
       if (typeof password !== 'string' || !(await secretMatches(password, passphrase))) {
         // The handle has not been consumed, so the same form can be retried.
         return new Response(consentPage(null, handle, 'Incorrect password.'), {

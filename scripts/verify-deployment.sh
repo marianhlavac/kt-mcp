@@ -25,9 +25,14 @@ retry=()
 echo "Verifying $BASE"
 
 # 1. Reachable, and PUBLIC_URL-free: the Worker derives its endpoint from the request.
-health=$(curl -fsS --max-time 15 "${retry[@]}" "$BASE/healthz" 2>/dev/null)
-if [[ -z "$health" ]]; then
-  fail "GET /healthz not reachable. Check 'wrangler deployments list' and that the route or workers.dev subdomain is enabled"
+healthfile=$(mktemp); trap 'rm -f "$healthfile"' EXIT
+code=$(curl -sS --max-time 15 ${retry[@]+"${retry[@]}"} -o "$healthfile" -w '%{http_code}' "$BASE/healthz" 2>/dev/null || echo 000)
+health=$(cat "$healthfile")
+if [[ "$code" == "500" ]]; then
+  fail "GET /healthz → 500: the Worker is deployed but misconfigured. Run 'npx wrangler tail' and request /healthz again to see which secret or binding is missing"
+  echo; echo "$fails check(s) failed."; exit 1
+elif [[ "$code" != "200" ]]; then
+  fail "GET /healthz → $code. Check 'npx wrangler deployments list' and that the route or workers.dev subdomain is enabled"
   echo; echo "$fails check(s) failed."; exit 1
 fi
 pass "GET /healthz reachable"
